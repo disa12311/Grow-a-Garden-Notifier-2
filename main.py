@@ -1,11 +1,8 @@
 import discord
 import re
 import requests
-import json # Cần import json nếu CHANNEL_IDS được đọc từ biến môi trường dạng JSON
-import os   # Cần import os nếu DISCORD_TOKEN, NTFY_TOPIC được đọc từ biến môi trường
-
-# Import các biến cấu hình từ tệp config.py
-# Đảm bảo rằng config.py của bạn đã được cập nhật để đọc các biến này từ môi trường Railway
+import json
+import os
 from config import DISCORD_TOKEN, CHANNEL_IDS, NTFY_TOPIC
 
 # Các danh sách và từ điển cấu hình cho vật phẩm và màu sắc
@@ -157,75 +154,109 @@ async def on_ready():
     Sự kiện khi bot đã sẵn sàng và đăng nhập thành công.
     """
     print(f"Logged in as {client.user} ({client.user.id})")
-    # In ra các kênh bot đang theo dõi từ CHANNEL_IDS.values()
-    print(f"Bot is ready to process messages in channels: {CHANNEL_IDS.values()}")
+    print(f"Bot is ready to process messages in channels (configured IDs): {CHANNEL_IDS.values()}")
+    # === DEBUG: In ra cấu hình CHANNEL_IDS để kiểm tra ===
+    print(f"Full CHANNEL_IDS dictionary: {CHANNEL_IDS}")
+    # =====================================================
 
 # Tạo danh sách các mục kết hợp để kiểm tra thông báo
 combined_items = default_priority_items + high_priority_items
 
 @client.event
 async def on_message(message):
-    """
-    Sự kiện khi bot nhận được tin nhắn.
-    """
     global current_stock, previous_stock, items_to_notify
 
-    # Bỏ qua tin nhắn từ chính bot để tránh lặp vô hạn
-    # Bỏ qua tin nhắn nếu kênh không nằm trong danh sách CHANNEL_IDS được cấu hình
-    if message.author == client.user or message.channel.id not in CHANNEL_IDS.values():
+    # === DEBUG: In ra thông tin tin nhắn đầu vào ===
+    print(f"\n--- New Message Received ---")
+    print(f"Message Author: {message.author} (ID: {message.author.id})")
+    print(f"Message Channel ID: {message.channel.id}")
+    print(f"Message Content: '{message.content}'")
+    print(f"Has Embeds: {len(message.embeds) > 0}")
+    # =================================================
+
+    # Bỏ qua tin nhắn từ chính bot
+    if message.author == client.user:
+        print(f"Skipping own message from {message.author.name}")
         return
 
-    # Lấy tên kênh từ ID của kênh, giả sử CHANNEL_IDS là {tên_kênh: ID_kênh}
-    # Đây là một cách lấy tên kênh, có thể tối ưu hơn nếu CHANNEL_IDS được cấu trúc khác
-    # Ví dụ: channel_name = next((name for name, id_val in CHANNEL_IDS.items() if id_val == message.channel.id), None)
-    # Và sau đó kiểm tra 'if channel_name is None: return'
-    channel_name = [name for name, id_val in CHANNEL_IDS.items() if id_val == message.channel.id][0]
+    # Kiểm tra xem kênh tin nhắn có trong danh sách CHANNEL_IDS không
+    if message.channel.id not in CHANNEL_IDS.values():
+        print(f"Channel ID {message.channel.id} is NOT in configured CHANNEL_IDS. Skipping.")
+        return
+    else:
+        print(f"Channel ID {message.channel.id} IS IN configured CHANNEL_IDS.")
+
+    # Lấy tên kênh từ ID của kênh
+    channel_name = next((name for name, id_val in CHANNEL_IDS.items() if id_val == message.channel.id), None)
+    if channel_name is None: # Về lý thuyết không nên xảy ra nếu điều kiện trên đã đúng, nhưng thêm để an toàn
+        print(f"Could not find channel name for ID {message.channel.id}. Skipping.")
+        return
+
+    print(f"Processing message in channel: {channel_name}")
 
     any_stock_found = False
-    current_stock.clear() # Xóa danh sách stock hiện tại cho tin nhắn mới
-    items_to_notify.clear() # Xóa danh sách thông báo cho tin nhắn mới
+    current_stock.clear()
+    items_to_notify.clear()
+
+    if not message.embeds:
+        print("Message has no embeds. Skipping embed processing.")
+        return
 
     # Xử lý các embeds (nhúng) trong tin nhắn
-    for embed in message.embeds:
-        # Xử lý thông báo thời tiết nếu kênh là "Weather"
+    for embed_index, embed in enumerate(message.embeds):
+        print(f"Processing Embed #{embed_index + 1}")
+        print(f"Embed Title: {embed.title}")
+        print(f"Embed Description: {embed.description}")
+        print(f"Number of fields in Embed: {len(embed.fields)}")
+
+        # Xử lý thông báo thời tiết
         if channel_name == "Weather": # Bạn cần đảm bảo có một key "Weather" trong CHANNEL_IDS của mình
             print("\n╭── Weather Alert ──╮")
             if embed.title:
-                print(f"│ {embed.title}")
+                print(f"│ Title: {embed.title}")
             if embed.description:
                 for line in embed.description.splitlines():
-                    print(f"│ {line.strip()}")
+                    print(f"│ Desc: {line.strip()}")
             print("╰────────────────────╯")
             weather_msg = f"{embed.title or 'Weather Update'}\n{embed.description or ''}"
-            # Gửi thông báo Ntfy mà không chặn main event loop
             await client.loop.run_in_executor(
                 None, _send_ntfy_notification_blocking, "Weather Alert", weather_msg.strip(), "default"
             )
-            continue # Chuyển sang embed tiếp theo hoặc kết thúc xử lý tin nhắn nếu không có gì khác
+            print("Ntfy weather notification scheduled.")
+            continue
 
         # Xử lý các trường (fields) trong embed (thường chứa danh sách vật phẩm)
-        for field in embed.fields:
+        if not embed.fields:
+            print("Embed has no fields. Skipping field processing for this embed.")
+            continue
+
+        for field_index, field in enumerate(embed.fields):
+            print(f"Processing Field #{field_index + 1}: Name='{field.name.strip()}'")
             stock_items = extract_items(field.value) # Trích xuất vật phẩm từ giá trị của trường
+            print(f"Extracted {len(stock_items)} items from field value.")
+
             if not stock_items:
-                continue # Bỏ qua nếu không có vật phẩm nào được trích xuất
+                print(f"No stock items extracted from field '{field.name.strip()}'. Skipping.")
+                continue
 
             any_stock_found = True
             print(f"\n╭── {field.name.strip()} ──╮")
             for item_text in stock_items:
+                print(f"  Processing item: '{item_text}'")
                 current_stock.add(item_text) # Thêm vật phẩm vào danh sách stock hiện tại
 
                 # Kiểm tra các mục ưu tiên để thông báo nếu đó là vật phẩm MỚI
                 for notify_item in combined_items:
-                    # Kiểm tra xem item có trong danh sách cần thông báo VÀ CHƯA TỪNG được thông báo TRƯỚC ĐÓ không
                     if notify_item.lower() in item_text.lower() and item_text not in previous_stock:
                         items_to_notify.append(item_text)
+                        print(f"    - Added '{item_text}' to items_to_notify (NEW ITEM).")
 
                 # Xác định màu sắc để in ra console
                 item_color = None
                 for item_name, color in color_map.items():
                     if item_name.lower() in item_text.lower():
                         item_color = color
-                        break # Tìm thấy màu, thoát vòng lặp
+                        break
 
                 if item_color:
                     print(colorize_text(f"│ • {item_text}", item_color))
@@ -235,15 +266,18 @@ async def on_message(message):
 
     # Gửi thông báo Ntfy nếu có bất kỳ vật phẩm mới nào được tìm thấy
     if any_stock_found and items_to_notify:
+        print(f"Found new items to notify: {items_to_notify}")
         for item in items_to_notify:
             priority = "high" if any(h.lower() in item.lower() for h in high_priority_items) else "default"
-            # Gửi thông báo Ntfy mà không chặn main event loop
             await client.loop.run_in_executor(
                 None, _send_ntfy_notification_blocking, "Grow A Garden: New Stock", f"{item} is now on stock!", priority
             )
+            print(f"Ntfy notification scheduled for '{item}' with priority '{priority}'.")
+    else:
+        print("No new stock items found to notify.")
 
-    # Cập nhật previous_stock cho lần kiểm tra tiếp theo
     previous_stock = current_stock.copy()
+    print(f"Updated previous_stock. previous_stock now has {len(previous_stock)} items.")
+    print(f"--- Message Processing Complete ---")
 
-# Chạy bot
 client.run(DISCORD_TOKEN)
