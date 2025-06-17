@@ -1,6 +1,5 @@
 DISCORD_TOKEN = "your bot token id here"
 
-## stock channel = both seeds and gears
 CHANNEL_IDS = {
     "channelid1": "1384132746586095717",
     "channelid2": "1384341013895839864",
