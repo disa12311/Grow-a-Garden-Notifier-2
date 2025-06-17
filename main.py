@@ -1,8 +1,14 @@
 import discord
 import re
 import requests
+import json # Cần import json nếu CHANNEL_IDS được đọc từ biến môi trường dạng JSON
+import os   # Cần import os nếu DISCORD_TOKEN, NTFY_TOPIC được đọc từ biến môi trường
+
+# Import các biến cấu hình từ tệp config.py
+# Đảm bảo rằng config.py của bạn đã được cập nhật để đọc các biến này từ môi trường Railway
 from config import DISCORD_TOKEN, CHANNEL_IDS, NTFY_TOPIC
 
+# Các danh sách và từ điển cấu hình cho vật phẩm và màu sắc
 default_priority_items = [
     "Nectarine", "Mango", "Grape", "Mushroom", "Pepper", "Cacao",
     "Beanstalk", "Stone Pillar", "Bird Bath", "Lamp Post",
@@ -90,32 +96,51 @@ color_map = {
 
 RESET_COLOR = "\033[0m"
 
+# Các biến toàn cục để theo dõi trạng thái
 previous_stock = set()
 current_stock = set()
 items_to_notify = []
 
+# Cấu hình Intents cho bot Discord
 intents = discord.Intents.default()
+# Cần bật MESSAGE CONTENT INTENT trong Discord Developer Portal (phần Bot)
 intents.message_content = True
-intents.messages = True
-intents.guilds = True
+# intents.messages và intents.guilds đã được bao gồm trong discord.Intents.default()
+# nhưng việc để rõ ràng cũng không sao
+# intents.messages = True
+# intents.guilds = True
 
+# Khởi tạo Discord client với các intents đã cấu hình
 client = discord.Client(intents=intents)
 
 def extract_items(text):
+    """
+    Trích xuất các mục từ văn bản, loại bỏ emoji và định dạng Discord.
+    """
     lines = text.splitlines()
     cleaned = []
     for line in lines:
+        # Loại bỏ các emoji tùy chỉnh Discord (<:tên_emoji:ID>)
         line = re.sub(r"<:[^:]+:\d+>", "", line)
+        # Loại bỏ định dạng markdown (*, _, ~, `)
         line = re.sub(r"[*_~`]", "", line)
         line = line.strip()
+        # Chỉ thêm các dòng có chứa " x" (thường là số lượng vật phẩm)
         if " x" in line.lower():
             cleaned.append(line)
     return cleaned
 
 def colorize_text(text, color_code):
+    """
+    Thêm mã màu ANSI vào văn bản để in ra console.
+    """
     return f"{color_code}{text}{RESET_COLOR}"
 
-def send_ntfy_notification(title, message, priority="default"):
+def _send_ntfy_notification_blocking(title, message, priority):
+    """
+    Hàm gửi thông báo Ntfy. Hàm này là blocking I/O (đồng bộ).
+    Nó sẽ được gọi thông qua client.loop.run_in_executor để không chặn event loop chính.
+    """
     url = f"https://ntfy.sh/{NTFY_TOPIC}"
     headers = {
         "Title": title,
@@ -124,28 +149,46 @@ def send_ntfy_notification(title, message, priority="default"):
     try:
         requests.post(url, data=message.encode('utf-8'), headers=headers)
     except Exception as e:
-        print(f"Failed to send notification: {e}")
+        print(f"Failed to send Ntfy notification: {e}")
 
 @client.event
 async def on_ready():
+    """
+    Sự kiện khi bot đã sẵn sàng và đăng nhập thành công.
+    """
     print(f"Logged in as {client.user} ({client.user.id})")
+    # In ra các kênh bot đang theo dõi từ CHANNEL_IDS.values()
+    print(f"Bot is ready to process messages in channels: {CHANNEL_IDS.values()}")
 
+# Tạo danh sách các mục kết hợp để kiểm tra thông báo
 combined_items = default_priority_items + high_priority_items
 
 @client.event
 async def on_message(message):
+    """
+    Sự kiện khi bot nhận được tin nhắn.
+    """
     global current_stock, previous_stock, items_to_notify
 
-    if message.channel.id not in CHANNEL_IDS:
+    # Bỏ qua tin nhắn từ chính bot để tránh lặp vô hạn
+    # Bỏ qua tin nhắn nếu kênh không nằm trong danh sách CHANNEL_IDS được cấu hình
+    if message.author == client.user or message.channel.id not in CHANNEL_IDS.values():
         return
 
-    channel_name = CHANNEL_IDS[message.channel.id]
-    any_stock_found = False
-    current_stock.clear()
-    items_to_notify.clear()
+    # Lấy tên kênh từ ID của kênh, giả sử CHANNEL_IDS là {tên_kênh: ID_kênh}
+    # Đây là một cách lấy tên kênh, có thể tối ưu hơn nếu CHANNEL_IDS được cấu trúc khác
+    # Ví dụ: channel_name = next((name for name, id_val in CHANNEL_IDS.items() if id_val == message.channel.id), None)
+    # Và sau đó kiểm tra 'if channel_name is None: return'
+    channel_name = [name for name, id_val in CHANNEL_IDS.items() if id_val == message.channel.id][0]
 
+    any_stock_found = False
+    current_stock.clear() # Xóa danh sách stock hiện tại cho tin nhắn mới
+    items_to_notify.clear() # Xóa danh sách thông báo cho tin nhắn mới
+
+    # Xử lý các embeds (nhúng) trong tin nhắn
     for embed in message.embeds:
-        if channel_name == "Weather":
+        # Xử lý thông báo thời tiết nếu kênh là "Weather"
+        if channel_name == "Weather": # Bạn cần đảm bảo có một key "Weather" trong CHANNEL_IDS của mình
             print("\n╭── Weather Alert ──╮")
             if embed.title:
                 print(f"│ {embed.title}")
@@ -154,27 +197,35 @@ async def on_message(message):
                     print(f"│ {line.strip()}")
             print("╰────────────────────╯")
             weather_msg = f"{embed.title or 'Weather Update'}\n{embed.description or ''}"
-            send_ntfy_notification("Weather Alert", weather_msg.strip())
-            continue
+            # Gửi thông báo Ntfy mà không chặn main event loop
+            await client.loop.run_in_executor(
+                None, _send_ntfy_notification_blocking, "Weather Alert", weather_msg.strip(), "default"
+            )
+            continue # Chuyển sang embed tiếp theo hoặc kết thúc xử lý tin nhắn nếu không có gì khác
 
+        # Xử lý các trường (fields) trong embed (thường chứa danh sách vật phẩm)
         for field in embed.fields:
-            stock_items = extract_items(field.value)
+            stock_items = extract_items(field.value) # Trích xuất vật phẩm từ giá trị của trường
             if not stock_items:
-                continue
+                continue # Bỏ qua nếu không có vật phẩm nào được trích xuất
+
             any_stock_found = True
             print(f"\n╭── {field.name.strip()} ──╮")
             for item_text in stock_items:
-                current_stock.add(item_text)
+                current_stock.add(item_text) # Thêm vật phẩm vào danh sách stock hiện tại
 
+                # Kiểm tra các mục ưu tiên để thông báo nếu đó là vật phẩm MỚI
                 for notify_item in combined_items:
+                    # Kiểm tra xem item có trong danh sách cần thông báo VÀ CHƯA TỪNG được thông báo TRƯỚC ĐÓ không
                     if notify_item.lower() in item_text.lower() and item_text not in previous_stock:
                         items_to_notify.append(item_text)
 
+                # Xác định màu sắc để in ra console
                 item_color = None
                 for item_name, color in color_map.items():
                     if item_name.lower() in item_text.lower():
                         item_color = color
-                        break
+                        break # Tìm thấy màu, thoát vòng lặp
 
                 if item_color:
                     print(colorize_text(f"│ • {item_text}", item_color))
@@ -182,11 +233,17 @@ async def on_message(message):
                     print(f"│ • {item_text}")
             print("╰" + "─" * (len(field.name.strip()) + 6) + "╯")
 
+    # Gửi thông báo Ntfy nếu có bất kỳ vật phẩm mới nào được tìm thấy
     if any_stock_found and items_to_notify:
         for item in items_to_notify:
             priority = "high" if any(h.lower() in item.lower() for h in high_priority_items) else "default"
-            send_ntfy_notification("Grow A Garden: New Stock", f"{item} is now on stock!", priority=priority)
+            # Gửi thông báo Ntfy mà không chặn main event loop
+            await client.loop.run_in_executor(
+                None, _send_ntfy_notification_blocking, "Grow A Garden: New Stock", f"{item} is now on stock!", priority
+            )
 
+    # Cập nhật previous_stock cho lần kiểm tra tiếp theo
     previous_stock = current_stock.copy()
 
+# Chạy bot
 client.run(DISCORD_TOKEN)
